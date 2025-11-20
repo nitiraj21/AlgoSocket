@@ -23,7 +23,11 @@ const server = http_1.default.createServer(app);
 let MATCH_DURATION_MINUTES = null;
 const io = new socket_io_1.Server(server, {
     cors: {
-        origin: 'http://172.20.10.2:3000',
+        origin: [
+            'http://localhost:3000',
+            'https://algowars.duckdns.org',
+            'https://algowars-kappa.vercel.app'
+        ],
         methods: ['GET', 'POST'],
     },
 });
@@ -35,6 +39,28 @@ function calculateXPByRank(rank) {
         case 3: return 30; // Third place
         default: return 20; // Everyone else
     }
+}
+// Helper function to get and emit updated participants
+function emitUpdatedParticipants(roomCode, roomId) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const updatedParticipants = yield prisma.matchParticipant.findMany({
+                where: { roomId: roomId },
+                select: {
+                    role: true,
+                    score: true,
+                    rank: true,
+                    user: { select: { username: true, ProfilePic: true } }
+                },
+                orderBy: { score: 'desc' } // Order by score for consistent ranking
+            });
+            console.log(`[DEBUG] Emitting participants update for room ${roomCode}:`, updatedParticipants);
+            io.to(roomCode).emit('room-participants-updated', { participants: updatedParticipants });
+        }
+        catch (error) {
+            console.error(`Error fetching updated participants for room ${roomCode}:`, error);
+        }
+    });
 }
 // Helper function to assign ranks and distribute XP
 function finishMatchWithRanking(roomCode, roomId) {
@@ -51,7 +77,6 @@ function finishMatchWithRanking(roomCode, roomId) {
                 return;
             }
             // Assign ranks and update participants
-            //@ts-ignore
             const updates = participants.map((participant, index) => __awaiter(this, void 0, void 0, function* () {
                 const rank = index + 1;
                 const xpGained = calculateXPByRank(rank);
@@ -85,7 +110,6 @@ function finishMatchWithRanking(roomCode, roomId) {
                     score: winner.score,
                     rank: winner.rank,
                 },
-                //@ts-ignore
                 finalRankings: rankedParticipants.map(p => ({
                     user: p.user,
                     score: p.score,
@@ -94,7 +118,6 @@ function finishMatchWithRanking(roomCode, roomId) {
                 })),
             });
             console.log(`🏆 Match ${roomCode} finished with rankings:`);
-            //@ts-ignore
             rankedParticipants.forEach(p => {
                 console.log(`  ${p.rank}. ${p.user.username} - Score: ${p.score} (+${p.xpGained} XP)`);
             });
@@ -108,6 +131,7 @@ io.on('connection', (socket) => {
     console.log('✅ A user connected:', socket.id);
     socket.on('join-room', (roomCode, username) => __awaiter(void 0, void 0, void 0, function* () {
         socket.join(roomCode);
+        console.log(`[DEBUG] User ${username} attempting to join room ${roomCode}`);
         try {
             const room = yield prisma.room.findUnique({
                 where: { code: roomCode },
@@ -115,9 +139,13 @@ io.on('connection', (socket) => {
             });
             if (!room) {
                 console.error(`Join-room failed: Room with code '${roomCode}' not found.`);
+                socket.emit('error', { message: 'Room not found' });
                 return;
             }
-            if (room.status === 'WAITING') {
+            // Allow joining in WAITING and IN_PROGRESS states
+            if (room.status === 'FINISHED') {
+                console.error(`Join-room failed: Room ${roomCode} is finished.`);
+                socket.emit('error', { message: 'Room is finished' });
                 return;
             }
             const roomId = room.id;
@@ -127,30 +155,43 @@ io.on('connection', (socket) => {
             });
             if (!user) {
                 console.error(`Join-room failed: User '${username}' not found.`);
+                socket.emit('error', { message: 'User not found' });
                 return;
             }
-            yield prisma.matchParticipant.upsert({
+            // Check if user is already in the room
+            const existingParticipant = yield prisma.matchParticipant.findUnique({
                 where: { userId_roomId: { userId: user.id, roomId: roomId } },
-                update: {},
-                create: { userId: user.id, roomId: roomId, role: 'PARTICIPANT' },
             });
-            const updatedParticipants = yield prisma.matchParticipant.findMany({
-                where: { roomId: roomId },
-                select: {
-                    role: true,
-                    score: true,
-                    rank: true,
-                    user: { select: { username: true, ProfilePic: true } }
-                }
-            });
-            io.to(roomCode).emit('room-participants-updated', { participants: updatedParticipants });
+            if (!existingParticipant) {
+                // Only create participant if they don't already exist
+                yield prisma.matchParticipant.create({
+                    data: {
+                        userId: user.id,
+                        roomId: roomId,
+                        role: 'PARTICIPANT',
+                        score: 0,
+                        rank: null
+                    },
+                });
+                console.log(`[DEBUG] Created new participant for user ${username}`);
+            }
+            else {
+                console.log(`[DEBUG] User ${username} already exists in room, updating connection`);
+            }
+            // Emit confirmation to the joining user
+            socket.emit('user-joined', { username: username });
+            console.log(`[DEBUG] Confirmed user ${username} joined room ${roomCode}`);
+            // Always emit updated participants list to ALL users in the room
+            yield emitUpdatedParticipants(roomCode, roomId);
         }
         catch (error) {
             console.error('Error on join-room:', error);
+            socket.emit('error', { message: 'Failed to join room' });
         }
     }));
     socket.on('disconnect', () => {
         console.log('❌ A user disconnected:', socket.id);
+        // Handle cleanup for in-memory room tracking
         socket.rooms.forEach(roomId => {
             if (roomId === socket.id)
                 return;
@@ -177,7 +218,7 @@ io.on('connection', (socket) => {
         try {
             const room = yield prisma.room.findUnique({
                 where: { code: roomCode },
-                select: { id: true, status: true }
+                select: { id: true, duration: true, status: true }
             });
             if (!room) {
                 console.error(`Start match failed: Room ${roomCode} not found.`);
@@ -189,40 +230,45 @@ io.on('connection', (socket) => {
                 console.warn(`Room ${roomCode} already in progress`);
                 return;
             }
+            // Use the room's duration, not the global variable
+            const matchDurationMinutes = room.duration;
             let endTime = null;
-            let timeoutId = null;
-            if (MATCH_DURATION_MINUTES && MATCH_DURATION_MINUTES > 0) {
-                endTime = new Date(Date.now() + MATCH_DURATION_MINUTES * 60 * 1000);
+            if (matchDurationMinutes && matchDurationMinutes > 0) {
+                endTime = new Date(Date.now() + matchDurationMinutes * 60 * 1000);
             }
             // Update room status and end time
-            const updatedRoom = yield prisma.room.update({
+            yield prisma.room.update({
                 where: { id: room.id },
                 data: {
                     status: 'IN_PROGRESS',
                     matchEndedAt: endTime,
                 },
             });
-            // Emit match started with the end time
+            // Emit match started with complete information
             io.to(roomCode).emit('match-started', {
                 endTime: endTime ? endTime.toISOString() : null,
-                duration: MATCH_DURATION_MINUTES
+                duration: matchDurationMinutes,
+                startTime: new Date().toISOString()
             });
+            console.log(`🚀 Match ${roomCode} started with duration: ${matchDurationMinutes} minutes`);
+            console.log(`⏰ Match will end at: ${endTime ? endTime.toISOString() : 'No time limit'}`);
             // Set up timeout for match end
-            if (MATCH_DURATION_MINUTES && MATCH_DURATION_MINUTES > 0) {
-                timeoutId = setTimeout(() => __awaiter(void 0, void 0, void 0, function* () {
+            if (matchDurationMinutes && matchDurationMinutes > 0) {
+                setTimeout(() => __awaiter(void 0, void 0, void 0, function* () {
                     try {
                         const currentRoom = yield prisma.room.findUnique({
                             where: { code: roomCode },
                             select: { id: true, status: true }
                         });
                         if (!currentRoom || currentRoom.status !== 'IN_PROGRESS') {
-                            return; // Room was already finished or doesn't exist
+                            console.log(`⚠️  Room ${roomCode} is no longer in progress, skipping timeout finish`);
+                            return;
                         }
+                        console.log(`⏰ Time's up for room ${roomCode}, finishing match...`);
                         yield prisma.room.update({
                             where: { id: currentRoom.id },
                             data: {
                                 status: 'FINISHED',
-                                actualEndTime: new Date() // Track when it actually ended
                             },
                         });
                         yield finishMatchWithRanking(roomCode, currentRoom.id);
@@ -235,10 +281,7 @@ io.on('connection', (socket) => {
                         console.error(`Error finishing match for room ${roomCode}:`, error);
                         io.to(roomCode).emit('error', { message: 'Error ending match' });
                     }
-                }), MATCH_DURATION_MINUTES * 60 * 1000);
-                // Store timeout ID in case we need to cancel it
-                // You might want to store this in Redis or memory for cleanup
-                console.log(`Match ${roomCode} will end in ${MATCH_DURATION_MINUTES} minutes`);
+                }), matchDurationMinutes * 60 * 1000);
             }
         }
         catch (error) {
@@ -246,7 +289,7 @@ io.on('connection', (socket) => {
             socket.emit('error', { message: 'Error starting match' });
         }
     }));
-    socket.on('correct-submission', ({ roomCode, userEmail, points }) => __awaiter(void 0, void 0, void 0, function* () {
+    socket.on('correct-submission', (_a) => __awaiter(void 0, [_a], void 0, function* ({ roomCode, userEmail, points }) {
         console.log(`[DEBUG] correct-submission received: userEmail='${userEmail}', roomCode='${roomCode}'`);
         try {
             if (!userEmail) {
@@ -280,20 +323,8 @@ io.on('connection', (socket) => {
                 data: { score: { increment: points } },
             });
             console.log("[DEBUG] Score incremented successfully in DB.");
-            const updatedRoom = yield prisma.room.findUnique({
-                where: { id: roomId },
-                include: {
-                    participants: {
-                        include: { user: { select: { username: true, id: true } } },
-                    },
-                },
-            });
-            if (updatedRoom) {
-                io.to(roomCode).emit('room-participants-updated', {
-                    participants: updatedRoom.participants,
-                });
-                console.log("[DEBUG] Sent updated participants list to room.");
-            }
+            // Use the helper function to emit updated participants
+            yield emitUpdatedParticipants(roomCode, roomId);
         }
         catch (error) {
             console.error('Error updating score:', error);
@@ -322,6 +353,6 @@ io.on('connection', (socket) => {
     }));
 });
 const PORT = 5000;
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, () => {
     console.log(`Server running on port: ${PORT}`);
 });
