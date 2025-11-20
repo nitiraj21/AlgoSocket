@@ -16,11 +16,7 @@ const server = http.createServer(app);
 let MATCH_DURATION_MINUTES: number | null = null;
 const io = new Server(server, {
   cors: {
-    origin: [
-      'http://localhost:3000',
-      'https://algowars.duckdns.org',
-      'https://algowars-kappa.vercel.app'
-    ],
+    origin: "*",
     methods: ['GET', 'POST'],
   },
 });
