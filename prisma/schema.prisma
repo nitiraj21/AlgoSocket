@@ -1,0 +1,91 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+model User {
+  id            String             @id @default(cuid())
+  username      String             @unique
+  email         String             @unique
+  password      String
+  ProfilePic    String?
+  createdAt     DateTime           @default(now())
+  roomsHosted   Room[]             @relation("RoomsHostedByUser")                               
+  matchHistory  MatchParticipant[] @relation("UserRoomsJoined")
+  isAdmin       Boolean            @default(false)
+  wins          Int                @default(0)
+  matches       Int                @default(0)
+  XP            Int?                @default(300)
+}
+
+model Room {
+  id              String             @id @default(cuid())
+  hostId          String
+  host            User               @relation("RoomsHostedByUser", fields: [hostId], references: [id])
+  name            String    
+  isPrivate       Boolean            @default(false)
+  code            String?            @unique
+  status          RoomStatus         @default(WAITING)
+  createdAt       DateTime           @default(now())
+  participants    MatchParticipant[] @relation("ParticipantsInRoom")  
+  questions       Problem[]        
+  matchEndedAt    DateTime?
+  duration        Int?
+}
+
+model MatchParticipant {
+  id        String   @id @default(cuid())
+  user      User     @relation("UserRoomsJoined", fields: [userId], references: [id])
+  userId    String
+  role      role     @default(PARTICIPANT)     
+  room      Room     @relation("ParticipantsInRoom", fields: [roomId], references: [id])
+  roomId    String
+  score     Int      @default(0)
+  rank      Int?   
+  joinedAt  DateTime @default(now())
+   @@unique([userId, roomId])
+}
+
+model Problem {
+  id              String      @id @default(cuid())
+  title           String
+  slug            String      @unique 
+  description     String
+  starterCode     Json?  
+  tags            String[] 
+  constraints     String   
+  testCases       Json?
+  testCasesDisplay String?
+  difficulty      Difficulty  @default(EASY)
+  functionName    String?
+  inputSignature  Json?
+  driverCode      Json?
+  rooms        Room[]      
+}
+
+enum RoomStatus{
+  WAITING
+  IN_PROGRESS
+  FINISHED
+}
+
+enum Difficulty{
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum role{
+  host
+  PARTICIPANT
+}
